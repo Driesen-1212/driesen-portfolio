@@ -79,6 +79,12 @@ body {
 }
 
 img { display: block; max-width: 100%; }
+/* 图片现在带 width/height 属性（防塌版、防抖动）。但 height 属性会被当成
+   「height: 1500px」这样的真实样式落地，只要某条 CSS 只写了 width:100%
+   而没写 height，那张图就会被拉成固有高度（cover 一裁，只剩半张脸）。
+   统一把「有固有尺寸的图」的高度打回 auto，让下面的 aspect-ratio / 比例自己算。
+   需要定高的地方（.screens / .cf-card / 头像）都显式写了 height，不受影响。 */
+img[width][height] { height: auto; }
 /* 按需加载的占位是透明 1×1，不会糊；加载完自然出现 */
 img { transition: opacity .4s var(--ease); }
 a { color: inherit; text-decoration: none; }
