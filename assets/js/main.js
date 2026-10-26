@@ -11,6 +11,90 @@
   const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ==========================================================
+     0. 图片按需加载（手机端内存）
+     全站 119 张图一起解码约 790MB，而手机浏览器单标签页通常只给
+     200~400MB，超了整页会被系统回收 —— 表现就是「白屏一下，然后
+     回到 enter 界面」。所以这里不再让浏览器一口气拉完：
+       · 每张图先只放 1×1 占位，真实地址存 data-src，比例靠
+         width/height 撑住（不会塌版）；
+       · 章节快进视口时才放图（IntersectionObserver，提前 1.2 屏）；
+       · 摄影区的唱片架另外按「当前张 ±2」开窗，滑到哪算哪。
+     ========================================================== */
+  const IMG_PH = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  const SIZES = window.IMG_SIZES || {};
+  const sizeOf = src => SIZES[src] || [1600, 1067];
+
+  /* 生成 <img> 的属性串：占位 + 真实地址 + 固有宽高，避免加载前塌版 */
+  function imgAttrs(src, alt, extra) {
+    const [w, h] = sizeOf(src);
+    return `src="${IMG_PH}" data-src="${src}" width="${w}" height="${h}" ` +
+           `loading="lazy" decoding="async" alt="${alt}"${extra ? ' ' + extra : ''}`;
+  }
+
+  function hydrateImg(img) {
+    if (!img || !img.dataset || !img.dataset.src) return;
+    const src = img.dataset.src;
+    delete img.dataset.src;
+    img.addEventListener('load', () => img.classList.remove('is-lazy'), { once: true });
+    img.setAttribute('src', src);
+    if (img.complete && img.naturalWidth) img.classList.remove('is-lazy');
+  }
+
+  /* 已经加载的图退回占位，释放解码内存（只给唱片架用） */
+  function deferImg(img) {
+    if (!img || !img.dataset || img.dataset.src) return;
+    const src = img.getAttribute('src') || '';
+    if (!src || src.indexOf('data:') === 0) return;
+    const [w, h] = sizeOf(src);
+    if (!img.getAttribute('width')) img.setAttribute('width', w);
+    if (!img.getAttribute('height')) img.getAttribute('height', h);
+    img.dataset.src = src;
+    img.setAttribute('src', IMG_PH);
+  }
+
+  /* 逐张观察：离视口还有一屏半就放图；滚过去两屏半就退回占位，
+     把解码内存还回去。这样无论往下滚多远，常驻内存都是「附近十几张」
+     的量级，而不是把 119 张全扛着。 */
+  const lazyImgs = [];
+  let sweepQueued = false;
+
+  function sweepLazy() {
+    const vh = window.innerHeight, vw = window.innerWidth;
+    for (let i = 0; i < lazyImgs.length; i++) {
+      const img = lazyImgs[i];
+      if (img.dataset.src) continue;              /* 已经是占位 */
+      const r = img.getBoundingClientRect();
+      if (r.bottom < -2.5 * vh || r.top > 3.5 * vh ||
+          r.right < -2.5 * vw || r.left > 3.5 * vw) deferImg(img);
+    }
+  }
+
+  function watchLazy() {
+    const imgs = $$('img[data-src]').filter(i => !i.closest('.cf-stage'));
+    if (!imgs.length) return;
+    if (!('IntersectionObserver' in window)) { imgs.forEach(hydrateImg); return; }
+
+    imgs.forEach(i => lazyImgs.push(i));
+
+    const io = new IntersectionObserver(entries => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        const img = en.target;
+        if (img.classList.contains('is-lazy')) img.classList.remove('is-lazy');
+        hydrateImg(img);
+      }
+    }, { rootMargin: '150% 0px 150% 0px' });
+
+    imgs.forEach(i => io.observe(i));
+
+    window.addEventListener('scroll', () => {
+      if (sweepQueued) return;
+      sweepQueued = true;
+      setTimeout(() => { sweepQueued = false; sweepLazy(); }, 340);
+    }, { passive: true });
+  }
+
+  /* ==========================================================
      1. 产品开发 — PRD 结构（复刻参考站案例卡）
      ========================================================== */
   function renderWorks() {
@@ -90,7 +174,9 @@
     const items = window.PHOTOS.map((p, i) => {
       const fig = document.createElement('figure');
       fig.className = 'cf-item';
-      fig.innerHTML = `<div class="cf-card"><img src="assets/photos/${p.f}" alt="${p.cn} · ${p.en}" draggable="false" decoding="async" /></div>`;
+      /* 卡片最大只有 430px 高，用 760px 宽的缩略图就够 —— 原图解码
+         13.7MB/张，五张开窗就是 68MB，手机上没必要 */
+      fig.innerHTML = `<div class="cf-card"><img ${imgAttrs('assets/photos/cf/' + p.f, p.cn + ' · ' + p.en, 'draggable="false"')} /></div>`;
       stage.appendChild(fig);
       return { fig, img: fig.querySelector('img'), p, i, w: 0 };
     });
@@ -112,9 +198,10 @@
       const narrow = sw < 700;
       cardH = Math.round(Math.min(Math.max(sh * (narrow ? 0.74 : 0.68), 190), sw * 0.98, 430));
       items.forEach(it => {
-        const iw = it.img.naturalWidth || 1600;
-        const ih = it.img.naturalHeight || 1067;
-        const asp = iw / ih;
+        /* 尺寸不看 naturalWidth —— 图现在是按需加载的，绝大多数还没解码。
+           用 sizes.js 里的固有尺寸算比例，任何时候都准 */
+        const sz = sizeOf('assets/photos/cf/' + it.p.f);
+        const asp = sz[0] / sz[1];
         let h = cardH;
         let w = Math.round(h * asp);
         const maxW = Math.round(sw * (narrow ? 0.84 : 0.78));
@@ -143,6 +230,11 @@
         it.fig.style.opacity = ad > 3.4 ? '0' : String(Math.max(0.22, 1 - ad * 0.17));
         it.fig.style.zIndex = String(200 - Math.round(ad * 10));
         it.fig.style.pointerEvents = ad > 3.4 ? 'none' : 'auto';
+
+        /* 只留当前张前后两张的真图，其余还原成占位：唱片架 31 张
+           全解码要 424MB，手机上光这一块就能把标签页撑爆 */
+        if (ad <= 3.4) hydrateImg(it.img);
+        else if (ad > 4.6) deferImg(it.img);
       });
     }
 
@@ -325,7 +417,7 @@
       const g = window.SCREENS.find(x => x.key === key);
       body.innerHTML = `<div class="screens">${g.files.map((f, i) => `
         <figure class="reveal" style="--d:${Math.min(i, 8) * 0.04}s">
-          <img src="assets/${f}" alt="Style ${g.label} · Screen ${i + 1}" decoding="async" />
+          <img ${imgAttrs('assets/' + f, 'Style ' + g.label + ' · Screen ' + (i + 1))} />
         </figure>`).join('')}</div>`;
       makeDraggable(body.firstElementChild);
       observe();
@@ -348,7 +440,7 @@
     if (!host || !window.CHARACTERS) return;
     host.innerHTML = window.CHARACTERS.slice(0, 4).map((c, i) => `
       <figure class="char-card" style="--d:${i * 0.05}s">
-        <img src="assets/char/${c.f}" alt="${c.label}" decoding="async" />
+        <img ${imgAttrs('assets/char/' + c.f, c.label)} />
         <figcaption>${c.label}</figcaption>
       </figure>
     `).join('');
@@ -359,7 +451,7 @@
     if (!host || !window.AWAKEN) return;
     host.innerHTML = window.AWAKEN.map((f, i) => `
       <figure class="reveal" style="--d:${Math.min(i, 11) * 0.03}s">
-        <img src="assets/sb/${f.f}" alt="Frame ${f.n} · ${f.cn}" decoding="async" />
+        <img ${imgAttrs('assets/sb/' + f.f, 'Frame ' + f.n + ' · ' + f.cn)} />
         <figcaption>
           <span class="f-num">${f.n}</span>
           <span class="f-cn">${f.cn}</span>
@@ -374,7 +466,7 @@
     if (!host || !window.FRAMES) return;
     host.innerHTML = window.FRAMES.map((f, i) => `
       <figure class="reveal" style="--d:${Math.min(i, 11) * 0.04}s">
-        <img src="assets/frames-grid/${f.f}" alt="Frame ${f.n} · ${f.cn}" decoding="async" />
+        <img ${imgAttrs('assets/frames-grid/' + f.f, 'Frame ' + f.n + ' · ' + f.cn)} />
         <figcaption>
           <span class="f-num">${f.n}</span>
           <span class="f-cn">${f.cn}</span>
@@ -415,7 +507,7 @@
     if (!host || !window.ALBUM) return;
     host.innerHTML = window.ALBUM.pages.map((f, i) => `
       <figure class="album-page${i === 0 ? ' is-cover' : ''}" style="--d:${Math.min(i, 10) * 0.04}s">
-        <img src="assets/${f}" alt="${window.ALBUM.title} · Page ${i + 1}" decoding="async" />
+        <img ${imgAttrs('assets/' + f, window.ALBUM.title + ' · Page ' + (i + 1))} />
       </figure>
     `).join('');
   }
@@ -1060,6 +1152,8 @@
     const enter = () => {
       if (entered) return;
       entered = true;
+      /* 记一笔：万一之后页面被系统回收重载，别再把人扔回这里 */
+      try { sessionStorage.setItem('driesen:entered', '1'); } catch (_) {}
 
       /* ① 先归零再出声：两句都是同步的，仍在这次点击的手势栈里；
          先 seek 再 play，避免出声后立刻跳回 0:00 的那一下 */
@@ -1099,6 +1193,17 @@
      启动
      ========================================================== */
   function boot() {
+    /* 手机内存吃紧时，系统会把整页回收再自动重载 —— 重载后如果又弹
+       「进入」画面，人会以为自己被踢出去了。之前点过进入就记在
+       sessionStorage，重载直接进站，声音交给常规的点击解锁。 */
+    try {
+      if (sessionStorage.getItem('driesen:entered') === '1') {
+        const g = document.getElementById('gate');
+        if (g) g.remove();
+        document.documentElement.classList.remove('gate-lock');
+      }
+    } catch (_) {}
+
     renderWorks();
     renderDesignNotes();
     initCoverflow();
@@ -1117,6 +1222,7 @@
     initRevealFallback();
     initGate();          /* 内部决定首屏动效何时开始（有进入画面就等点击） */
     observe();
+    watchLazy();         /* 章节级按需放图，必须放在全部渲染之后 */
   }
 
   if (document.readyState === 'loading') {
