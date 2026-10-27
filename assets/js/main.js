@@ -628,6 +628,7 @@
     let booted = false;          // 静音基线是否已经播起来
     let userPaused = false;      // 用户主动点的暂停，不要自动救回
     let justUnlockedAt = 0;      // 刚被手势解锁的时间，避开同一次点击的开关逻辑
+    let swapping = false;        // 正在换元素：这期间旧元素的 pause 事件不算「被掐」
     let fadeTimer = null;
     const wait = ms => new Promise(r => setTimeout(r, ms));
 
@@ -645,7 +646,12 @@
       vinyl.dataset.snd = snd ? 'on' : 'off';
       if (state) state.textContent = !playing ? 'PAUSED' : (snd ? 'PLAYING' : 'SOUND OFF');
     };
-    ['play', 'playing', 'pause', 'ended', 'volumechange'].forEach(ev => audio.addEventListener(ev, refresh));
+    /* 事件绑定抽成函数：进入时可能换成一个「全新元素」来出声，
+       换了之后要把同一套监听挂到新元素上 */
+    const bindMedia = el => {
+      ['play', 'playing', 'pause', 'ended', 'volumechange'].forEach(ev => el.addEventListener(ev, refresh));
+      el.addEventListener('pause', onPause);
+    };
 
     const fadeTo = to => {
       if (!VOL_WRITABLE) { return; }        // iOS：交给系统音量
@@ -778,7 +784,9 @@
 
     /* 内核有时会延迟几百毫秒才掐掉「无手势出声」，所以 audible 之后
        继续盯 pause：不是用户点的暂停，就退回静音基线并重新等手势 */
-    audio.addEventListener('pause', () => {
+    function onPause() {
+      if (swapping) return;                  // 换元素时旧元素被我们主动暂停，不算异常
+      if (this && this.__detached) return;   // pause 事件是异步派发的，旧元素要永久豁免
       if (userPaused || !audible) return;
       audible = false;
       booted = false;
@@ -792,7 +800,8 @@
       bindUnlock();
       showNudge();
       refresh();
-    });
+    }
+    bindMedia(audio);
 
     /* ---------- 起播 ----------
        移动端（iOS Safari / 微信内置浏览器 / 大量 X5 内核）一律禁止
@@ -868,43 +877,91 @@
       if (p && p.catch) p.catch(() => {});
     });
 
-    /* 点「进入」这一下是真实用户激活：同一个手势栈里同步取消静音，
-       iOS 才认；随后用「进度是否推进」确认真的出声，而不是只看 muted */
+    /* 点「进入」这一下是真实用户激活。这里不走「先静音播、再取消静音」的老路 ——
+       那条路在 iOS Safari / 微信 X5 上经常被内核强制暂停，用户听到的就是没声。
+       改成：在手势栈里新建一个从未静音起播过的元素，直接带声 play()。
+       这是各端兼容性最稳的一条路（等于「点一下开始放背景音乐」）。 */
+    let armed = false;
     const enterAudible = () => new Promise(resolve => {
-      const t0 = audio.currentTime;
-      audio.muted = false;
-      if (VOL_WRITABLE) audio.volume = 0;
-      let p = null;
-      try { p = audio.play(); } catch (_) { p = null; }
-      const check = () => {
-        setTimeout(() => {
-          if (!audio.paused && !audio.muted && audio.currentTime > t0 + 0.03) {
+      armed = true;
+
+      /* 微信 X5：先跟桥打个招呼，部分版本不做这一步解码器不放开 */
+      try {
+        if (window.WeixinJSBridge && window.WeixinJSBridge.invoke) {
+          window.WeixinJSBridge.invoke('getNetworkType', {}, () => {});
+        }
+      } catch (_) {}
+
+      let el = null;
+      try {
+        /* 依旧用 video 承载 mp3：移动内核里 video 的播放权限比 audio 宽 */
+        el = document.createElement('video');
+        el.className = 'bgm-media';
+        el.src = 'assets/audio/bgm.mp3';
+        el.loop = true;
+        el.preload = 'auto';
+        el.setAttribute('playsinline', '');
+        el.setAttribute('webkit-playsinline', '');
+        el.muted = false;
+        el.volume = TARGET;                 // iOS 忽略（只读），交给系统音量
+        document.body.appendChild(el);
+      } catch (_) { el = null; }
+
+      const target = el || audio;            // 新建失败就退回老元素
+      target.muted = false;
+      if (VOL_WRITABLE) target.volume = TARGET;
+      const pull = () => {
+        try {
+          const p = target.play();
+          if (p && p.catch) p.catch(() => {});
+        } catch (_) {}
+      };
+      pull();                                // 手势栈内，同步第一下
+
+      let n = 0;
+      const settle = () => {
+        if (!target.paused) {                // 在播（哪怕还在缓冲）就是成了
+          if (target !== audio) {
+            const old = audio;
+            audio = target;                  // 换掉旧元素，回收预跑的那个
+            audio.id = 'bgm';
+            bindMedia(audio);
+            markAudible();                   // 先认定成功，再去停旧元素
+            swapping = true;                 // 旧元素接下来会因为被暂停而发 pause 事件
+            try { old.__detached = true; old.pause(); old.remove(); } catch (_) {}
+            swapping = false;
+          } else {
             markAudible();
-            resolve(true);
-            return;
           }
-          audio.muted = true;                  // 没成 → 退回静音基线，别留死状态
+          resolve(true);
+          return;
+        }
+        if (++n >= 3) {                       // 真出不来 → 回静音基线 + 兜底手势
+          try { target.pause(); } catch (_) {}
+          if (target !== audio) { try { target.remove(); } catch (_) {} }
+          audio.muted = true;
           if (VOL_WRITABLE) audio.volume = 0;
-          if (audio.paused) {
-            const rp = audio.play();
-            if (rp && rp.catch) rp.catch(() => {});
-          }
+          try { const rp = audio.play(); if (rp && rp.catch) rp.catch(() => {}); } catch (_) {}
           refresh();
           resolve(false);
-        }, 620);
+          return;
+        }
+        pull();
+        setTimeout(settle, 240);
       };
-      if (p && p.then) p.then(check, check);
-      else check();
+      setTimeout(settle, 300);
     });
 
-    /* 进入画面点进来之后才出声；万一这次没放开（极少数内核），
-       再退回「轻触屏幕」兜底，而不是让用户进去后一直静音 */
+    /* 供进入画面直接调用：点击回调里第一件事就是它，
+       保证仍在用户手势的同一个任务里，不被后续 DOM 操作挤出手势栈 */
+    window.__bgmEnter = () => enterAudible().then(ok => {
+      if (!ok) { showNudge(); bindUnlock(); }
+    });
+
+    /* 没走 __bgmEnter 的旧入口也兜一层；已经出声就不重复建元素 */
     window.addEventListener('site:enter', () => {
-      enterAudible().then(ok => {
-        if (ok) return;
-        showNudge();
-        bindUnlock();
-      });
+      if (audible || armed) return;
+      window.__bgmEnter();
     }, { once: true });
   }
 
@@ -973,9 +1030,9 @@
       if (entered) return;
       entered = true;
 
-      /* 音乐从 0:00 起 —— 进入前那段是静音预跑，听不见 */
-      const bgm = document.getElementById('bgm');
-      if (bgm) { try { bgm.currentTime = 0; } catch (_) {} }
+      /* 第一件事：在手势栈里把声音放出来（必须在任何 DOM 操作之前，
+         否则部分内核会认为手势已经用掉了，直接拒绝播放） */
+      if (window.__bgmEnter) window.__bgmEnter();
 
       root.classList.remove('gate-lock');
       gate.classList.add('is-out');
