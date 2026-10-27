@@ -62,9 +62,11 @@ html {
 
 html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; overflow-x: hidden; }
 
-/* 手机上滚到顶再往下拉，浏览器会触发「下拉刷新」把整页重载 ——
-   看起来就像白屏一下、又跳回 enter 画面。这里掐掉这个手势。 */
-html, body { overscroll-behavior-y: contain; }
+/* ⛔ 这里曾经写过 html, body { overscroll-behavior-y: contain }，用来掐掉
+   手机「下拉刷新」。实测在 Chrome / Chromium 内核上，只要 html 同时有
+   overflow-x: hidden，这条就会让整页彻底滚不动 —— 滚轮、触摸手势全部无效，
+   只有 JS 的 scrollTo 还能动。表现就是「点进站以后划不动、像卡死」。
+   别再加回来。防重载交给 sessionStorage 记状态（main.js 已经做了）。 */
 
 body {
   font-family: var(--font-cn);
